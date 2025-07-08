@@ -1,0 +1,320 @@
+import os
+os.environ["GPT4ALL_NO_CUDA"] = "1"
+os.environ["HF_HOME"] = "/tmp/huggingface"
+
+
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+import pickle
+import torch
+import re
+from huggingface_hub import snapshot_download,hf_hub_download
+from sentence_transformers import SentenceTransformer
+
+
+
+from mistral_inference import MistralModel  # ✅ Import your Mistral wrapper
+
+
+DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "permissions.xlsx")
+INDEX_DIR = "saved_index"
+
+# ✅ Permission dependency map
+PERMISSION_DEPENDENCIES = {
+    "Download": ["Read"],
+    "Modify": ["Download", "Read"],
+    "Modify Content": ["Modify", "Download", "Read"],
+    "Create By Move": ["Read"],
+    "Create": ["Create By Move", "Modify Content", "Modify", "Download", "Read"],
+    "Revise": ["Create By Move", "Modify Content", "Modify", "Download", "Read"],
+    "New View Version": ["Create By Move", "Modify Content", "Modify", "Download", "Read"],
+    "Delete": ["Modify Content", "Modify", "Download", "Read"],
+    "Read": [],
+    "Full Control (All)": [],
+    "Modify Identity": [],
+    "Modify Security Labels": [],
+    "Set State": [],
+    "Change Domain": [],
+    "Change Context": [],
+    "Change Permissions": [],
+    "Administrative": [],
+}
+
+def load_excel_data(filepath):
+    df = pd.read_excel(filepath)
+    print(f"Loaded {len(df)} rows and {len(df.columns)} columns.")
+    return df
+
+def embed_data(df, embed_model):
+    texts = df.astype(str).agg(' | '.join, axis=1).tolist()
+    embeddings = embed_model.encode(texts, show_progress_bar=True)
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(np.array(embeddings))
+    os.makedirs(INDEX_DIR, exist_ok=True)
+    faiss.write_index(index, f"{INDEX_DIR}/faiss.index")
+    with open(f"{INDEX_DIR}/texts.pkl", "wb") as f:
+        pickle.dump(texts, f)
+    return index, texts
+
+def load_saved_index():
+    index = faiss.read_index(f"{INDEX_DIR}/faiss.index")
+    with open(f"{INDEX_DIR}/texts.pkl", "rb") as f:
+        texts = pickle.load(f)
+    return index, texts
+
+
+
+def load_embedder():
+    local_model_path = snapshot_download(
+        repo_id="sentence-transformers/all-MiniLM-L6-v2",
+        local_dir_use_symlinks=False,
+        ignore_patterns=["*.msgpack"]
+    )
+    return SentenceTransformer(local_model_path)
+
+def load_local_llm():
+    model_id = "google/flan-t5-small"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
+    return model, tokenizer
+
+def handle_permission_dependency_query(user_query, df):
+    user_query = user_query.lower()
+    match = re.search(r"(?:can i\s+)?give\s+(.+?)\s+permission\b", user_query)
+    if not match:
+        return None
+
+    requested_permission = match.group(1).strip().title()
+    if requested_permission not in PERMISSION_DEPENDENCIES:
+        valid = ', '.join(PERMISSION_DEPENDENCIES.keys())
+        return f"Unknown permission: '{requested_permission}'. Valid permissions are: {valid}"
+
+    def extract_field(field):
+        pattern = rf"{field.lower()} ['\"]([^'\"]+)['\"]"
+        match = re.search(pattern, user_query)
+        return match.group(1).strip() if match else None
+
+    filters = {
+        "Site name": extract_field("site"),
+        "Site subtype": extract_field("site subtype"),
+        "Object name": extract_field("object name"),
+        "Scope": extract_field("scope"),
+        "Participant": extract_field("participant"),
+    }
+
+    filtered_df = df.copy()
+    for col, value in filters.items():
+        if value:
+            filtered_df = filtered_df[filtered_df[col].astype(str).str.lower() == value.lower()]
+
+    if filtered_df.empty:
+        return "No matching entry found for the given filter criteria."
+
+    granted_permissions = filtered_df.iloc[0].to_dict()
+    required_perms = PERMISSION_DEPENDENCIES[requested_permission]
+    missing = [perm for perm in required_perms if granted_permissions.get(perm, "").lower() != "yes"]
+
+    if missing:
+        return f"No, '{requested_permission}' permission requires {', '.join(missing)} permission(s) to be enabled."
+    return f"Yes, you may grant '{requested_permission}' permission as all dependencies are met."
+
+def handle_count_query(user_query, df):
+    user_query = user_query.lower()
+    match = re.search(r"(read|create|modify|delete|download|revise)", user_query)
+    if match:
+        perm = match.group(1).capitalize()
+        if perm in df.columns:
+            count = (df[perm].astype(str).str.lower() == "yes").sum()
+            return f"{count} entries have {perm} permission."
+        else:
+            return f"Permission column '{perm}' not found in Excel."
+    return None
+
+def handle_unique_values_query(user_query, df):
+    match = re.search(r"unique values? in (\w+)", user_query.lower())
+    if match:
+        col = match.group(1).capitalize()
+        if col in df.columns:
+            unique_vals = df[col].dropna().unique()
+            return f"Unique values in column '{col}': {', '.join(map(str, unique_vals))}"
+        else:
+            return f"Column '{col}' not found in Excel."
+    return None
+
+def handle_filter_query(user_query, df):
+    q = user_query.lower()
+    def extract_value(keys):
+        for key in keys:
+            pattern = rf"{key.lower()}\s+['\"]([^'\"]+)['\"]"
+            m = re.search(pattern, q)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    object_name = extract_value(["object name", "object", "object type"])
+    scope = extract_value(["scope"])
+    site = extract_value(["site name", "site"])
+    subtype = extract_value(["site subtype", "subtype"])
+    participant = extract_value(["participant"])
+
+    filtered_df = df
+    if site:
+        filtered_df = filtered_df[filtered_df["Site name"].astype(str).str.lower() == site.lower()]
+    if object_name:
+        filtered_df = filtered_df[filtered_df["Object name"].astype(str).str.lower() == object_name.lower()]
+    if scope:
+        filtered_df = filtered_df[filtered_df["Scope"].astype(str).str.lower() == scope.lower()]
+    if subtype:
+        filtered_df = filtered_df[filtered_df["Site subtype"].astype(str).str.lower() == subtype.lower()]
+    if participant and "Participant" in df.columns:
+        filtered_df = filtered_df[filtered_df["Participant"].astype(str).str.lower() == participant.lower()]
+
+    if filtered_df.empty:
+        return "No matching entries found for the given criteria."
+
+    if "Permissions" in filtered_df.columns:
+        perms_list = filtered_df["Permissions"].dropna().unique()
+        perms_str = ", ".join(perms_list)
+        return f"Permissions granted: {perms_str}"
+    else:
+        return "Permission column 'Permissions' not found in Excel."
+
+def handle_unique_reference_type_query(user_query, df):
+    reference_column = "Reference type"
+    if reference_column not in df.columns:
+        return f"Column '{reference_column}' not found in Excel."
+
+    query_map = {
+        "group": "wt.org.WTGroup",
+        "user": "wt.org.WTPrincipalReference",
+        "roleprincipal": "wt.org.WTRolePrincipal",
+        "organization": "wt.org.WTOrganization"
+    }
+
+    match = re.search(r"(unique|find)\s+(groups|users|roleprincipals?|organizations?)", user_query.lower())
+    if not match:
+        return None
+
+    role_type = match.group(2).rstrip("s")
+    ref_prefix = query_map.get(role_type)
+    if not ref_prefix:
+        return f"Unknown reference type '{role_type}'."
+
+    pattern = rf"^{re.escape(ref_prefix)}:(-?\d+):"
+    matched_ids = df[reference_column].dropna().astype(str).str.extract(pattern, expand=False).dropna()
+    unique_ids = sorted(matched_ids.unique(), key=lambda x: int(x))
+    return f"Found {len(unique_ids)} unique {role_type}(s): {', '.join(unique_ids)}"
+
+def detect_misconfigured_entries(df, permission_dependencies):
+    result = []
+    for perm, dependencies in permission_dependencies.items():
+        for dep in dependencies:
+            mask = (df[perm].astype(str).str.lower() == "yes") & (df[dep].astype(str).str.lower() != "yes")
+            if mask.any():
+                rows = df[mask].copy()
+                rows["Misconfiguration"] = f"{perm}=Yes but {dep}=No"
+                result.append(rows)
+    return pd.concat(result, ignore_index=True) if result else None
+
+def summarize_permission_usage(df):
+    usage_counts = {}
+    for col in PERMISSION_DEPENDENCIES:
+        if col in df.columns:
+            count = (df[col].astype(str).str.lower() == "yes").sum()
+            usage_counts[col] = count
+    sorted_counts = sorted(usage_counts.items(), key=lambda x: x[1], reverse=True)
+    return sorted_counts
+
+def query_bot(user_query, index, texts, embed_model, llm_model, tokenizer):
+    query_vec = embed_model.encode([user_query])
+    D, I = index.search(np.array(query_vec), k=3)
+    context = "\n".join([texts[i] for i in I[0]])
+    prompt = f"""You are a permissions assistant helping users understand access levels.
+Here are the most relevant entries from the data:
+{context}
+Answer the question: {user_query}
+"""
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+    outputs = llm_model.generate(**inputs, max_new_tokens=256)
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# ✅ INIT
+def initialize_all():
+    embed_model = load_embedder()
+    if os.path.exists(f"{INDEX_DIR}/faiss.index"):
+        index, texts = load_saved_index()
+        df = load_excel_data(DATA_PATH)
+    else:
+        df = load_excel_data(DATA_PATH)
+        index, texts = embed_data(df, embed_model)
+
+    llm_model, tokenizer = load_local_llm()
+
+    # ✅ Load Mistral from GGUF
+    MODEL_PATH = hf_hub_download(
+        repo_id="Buddingbuddies25/rag_bot",
+        filename="mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+    )
+    mistral_model = MistralModel(MODEL_PATH)
+
+    return df, index, texts, embed_model, llm_model, tokenizer, mistral_model
+
+# ✅ Main entry point
+def process_user_query(query, df, index, texts, embed_model, llm_model, tokenizer, mistral_model):
+    if not query.strip():
+        return "Please enter a valid question."
+
+    # ✅ Detect general vs Excel query
+    def is_general_question(query):
+        excel_keywords = [
+            "entries", "scope", "permission", "site", "site subtype",
+            "object type", "user", "group", "roleprincipal"
+        ]
+        q_lower = query.lower()
+        return not any(word in q_lower for word in excel_keywords)
+
+    # ✅ Use Mistral for general questions
+    if is_general_question(query):
+        return mistral_model.generate(query)
+
+    # ✅ Excel-based logic
+    if "misconfigured" in query.lower():
+        df_issues = detect_misconfigured_entries(df, PERMISSION_DEPENDENCIES)
+        if df_issues is None or df_issues.empty:
+            return "✅ No misconfigured permission entries found."
+        return df_issues
+
+    if "most used" in query.lower() or "most common" in query.lower():
+        counts = summarize_permission_usage(df)
+        top = counts[:5]
+        return "🔝 Most Used Permissions:\n" + "\n".join([f"{p}: {c}" for p, c in top])
+
+    if "least used" in query.lower():
+        counts = summarize_permission_usage(df)
+        bottom = counts[-5:]
+        return "🔽 Least Used Permissions:\n" + "\n".join([f"{p}: {c}" for p, c in bottom])
+
+    reference_type_answer = handle_unique_reference_type_query(query, df)
+    if reference_type_answer:
+        return reference_type_answer
+
+    dependency_answer = handle_permission_dependency_query(query, df)
+    if dependency_answer:
+        return dependency_answer
+
+    count_answer = handle_count_query(query, df)
+    if count_answer:
+        return count_answer
+
+    unique_answer = handle_unique_values_query(query, df)
+    if unique_answer:
+        return unique_answer
+
+    filter_answer = handle_filter_query(query, df)
+    if filter_answer and not filter_answer.startswith("No matching"):
+        return filter_answer
+
+    return query_bot(query, index, texts, embed_model, llm_model, tokenizer)

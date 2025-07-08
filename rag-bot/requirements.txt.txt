@@ -1,0 +1,11 @@
+pandas
+openpyxl
+sentence-transformers
+faiss-cpu
+transformers
+accelerate
+bitsandbytes
+streamlit
+torch
+llama-cpp-python==0.2.11
+huggingface_hub

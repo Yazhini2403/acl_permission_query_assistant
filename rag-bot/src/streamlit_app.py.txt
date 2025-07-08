@@ -1,0 +1,125 @@
+import streamlit as st
+import pandas as pd
+from rag_excel_bot import (
+    initialize_all,
+    process_user_query
+)
+
+# Load everything once
+@st.cache_resource
+def setup():
+    return initialize_all()
+
+# ✅ Unpack all 7 return values
+df, index, texts, embed_model, permission_llm, permission_tokenizer, general_llm = setup()
+
+# ---------------- UI Settings -------------------
+st.set_page_config(page_title="Permission Query Assistant", layout="wide")
+st.title("🔐 Permission Query Assistant")
+
+# 🌗 Theme toggle
+theme_choice = st.sidebar.radio("🌗 Theme Mode", ["Light", "Dark"], index=0)
+
+# Apply CSS styling based on theme
+if theme_choice == "Dark":
+    st.markdown(
+        """
+        <style>
+            body, .stApp { background-color: #1e1e1e; color: #f0f0f0; }
+            section[data-testid="stSidebar"] { background-color: #252526; color: #ffffff; }
+            div[data-testid="stSidebar"] .stRadio label,
+            .css-1n76uvr, .css-qbe2hs, .css-10trblm, .css-1v0mbdj,
+            div[data-testid="stMarkdownContainer"], label,
+            .stTextInput>div>div>input,
+            input, textarea, select, .stDataFrame, .css-1d391kg {
+                color: #ffffff !important;
+                background-color: #2a2a2a !important;
+                border: 1px solid #555 !important;
+            }
+            .stButton button {
+                color: #ffffff !important;
+                background-color: #333333 !important;
+            }
+            div.response-box-dark {
+                border: 1px solid #ccc;
+                padding: 1rem;
+                border-radius: 8px;
+                background-color: #2f2f2f;
+                color: #ffffff;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+else:
+    st.markdown(
+        """
+        <style>
+            body, .stApp { background-color: #ffffff; color: #000000; }
+            div[data-testid="stMarkdownContainer"] { color: #000000; }
+            .stTextInput>div>div>input {
+                background-color: #ffffff;
+                color: #000000;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+# ---------------- Session History -------------------
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+# ---------------- Query Input -------------------
+st.markdown("### 🔍 Ask a Question")
+query = st.text_input(
+    "Enter your permission query:",
+    placeholder="e.g., Can I give Download permission? or How many legs does a cat have?"
+)
+
+# ---------------- Query Execution -------------------
+if st.button("Run Query"):
+    if not query.strip():
+        st.warning("Please enter a valid query.")
+    else:
+        # ✅ Pass correct args
+        response = process_user_query(
+            query,
+            df,
+            index,
+            texts,
+            embed_model,
+            permission_llm,
+            permission_tokenizer,
+            general_llm  # ⬅️ Now passing Mistral wrapper
+        )
+
+        # Save to history
+        st.session_state.history.append((query, response))
+
+        # Show response
+        if isinstance(response, pd.DataFrame):
+            st.markdown("### ⚠️ Misconfigured Entries Detected:")
+            st.dataframe(response)
+        else:
+            if theme_choice == "Dark":
+                st.markdown(f"""
+                <div class="response-box-dark">
+                <strong>💡 Response:</strong><br>{response}
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div style="border: 1px solid #ccc; padding: 1rem; border-radius: 8px; background-color: #f0f4f8; color: #000000;">
+                <strong>💡 Response:</strong><br>{response}
+                </div>
+                """, unsafe_allow_html=True)
+
+# ---------------- History Display -------------------
+with st.expander("🕓 Query History"):
+    for q, r in st.session_state.history[::-1]:
+        if isinstance(r, pd.DataFrame):
+            st.markdown(f"**🧾 Query:** `{q}`")
+            st.dataframe(r)
+        else:
+            st.markdown(f"**🧾 Query:** `{q}`  \n**💡 Response:** {r}")

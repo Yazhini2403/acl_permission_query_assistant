@@ -1,0 +1,25 @@
+from llama_cpp import Llama
+
+class MistralModel:
+    def __init__(self, model_path):
+        self.model = Llama(
+            model_path=model_path,
+            n_ctx=3500,          # You can increase if needed, depending on your system
+            n_threads=4,         # Adjust based on your CPU cores
+            verbose=False
+        )
+
+    def generate(self, prompt):
+        # Format as proper Mistral [INST] prompt style
+        full_prompt = f"<s>[INST] {prompt.strip()} [/INST]"
+        
+        response = self.model(
+            prompt=full_prompt,
+            max_tokens=256,
+            temperature=0.7,         # A bit of randomness
+            top_p=0.95,
+            stop=["</s>"],           # Ensure cleaner stopping
+            echo=False
+        )
+
+        return response["choices"][0]["text"].strip()
